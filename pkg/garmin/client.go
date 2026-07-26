@@ -16,7 +16,8 @@ import (
 )
 
 type Client struct {
-	client *http.Client
+	client    *http.Client
+	ssoClient *http.Client
 
 	oauthToken  string
 	oauthSecret string
@@ -30,9 +31,11 @@ type Client struct {
 
 func NewClient() *Client {
 	jar, _ := cookiejar.New(nil)
+	ssoJar, _ := cookiejar.New(nil)
 	return &Client{
-		client:   &http.Client{Timeout: time.Minute, Jar: jar},
-		weightID: make(map[int64]string),
+		client:    &http.Client{Timeout: time.Minute, Jar: jar},
+		ssoClient: &http.Client{Timeout: time.Minute, Jar: ssoJar},
+		weightID:  make(map[int64]string),
 	}
 }
 

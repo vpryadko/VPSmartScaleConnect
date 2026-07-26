@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"strings"
 	"time"
@@ -15,12 +16,31 @@ import (
 )
 
 func (c *Client) Login(username, password string) error {
-	ticket, err := c.getTicket(username, password)
-	if err != nil {
-		return err
+	// Retry up to 3 times with exponential backoff on rate limiting
+	delays := []time.Duration{0, 5 * time.Second, 15 * time.Second}
+	var err error
+	for _, delay := range delays {
+		if delay > 0 {
+			time.Sleep(delay)
+			// Reset cookie jar for fresh session
+			jar, _ := cookiejar.New(nil)
+			c.ssoClient.Jar = jar
+		}
+		var ticket string
+		ticket, err = c.getTicket(username, password)
+		if err == nil {
+			return c.getCredentials(ticket)
+		}
+		if !strings.Contains(err.Error(), "rate limited") {
+			return err
+		}
 	}
-	return c.getCredentials(ticket)
+	return err
 }
+
+// browserUserAgent mimics a real browser to bypass Cloudflare TLS fingerprinting
+// on Garmin SSO endpoints. Without this, requests are blocked as non-browser clients.
+const browserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 // getTicket - first stage exchange username and password to OAuth ticket
 func (c *Client) getTicket(username, password string) (string, error) {
@@ -29,7 +49,13 @@ func (c *Client) getTicket(username, password string) (string, error) {
 		"embedWidget=true&" +
 		"gauthHost=https://sso.garmin.com/sso"
 
-	res, err := c.client.Get(url1)
+	req1, err := http.NewRequest("GET", url1, nil)
+	if err != nil {
+		return "", err
+	}
+	req1.Header.Set("User-Agent", browserUserAgent)
+
+	res, err := c.ssoClient.Do(req1)
 	if err != nil {
 		return "", err
 	}
@@ -45,7 +71,13 @@ func (c *Client) getTicket(username, password string) (string, error) {
 		"service=https://sso.garmin.com/sso/embed&" +
 		"source=https://sso.garmin.com/sso/embed"
 
-	res, err = c.client.Get(url2)
+	req2, err := http.NewRequest("GET", url2, nil)
+	if err != nil {
+		return "", err
+	}
+	req2.Header.Set("User-Agent", browserUserAgent)
+
+	res, err = c.ssoClient.Do(req2)
 	if err != nil {
 		return "", err
 	}
@@ -69,10 +101,11 @@ func (c *Client) getTicket(username, password string) (string, error) {
 		return "", err
 	}
 
+	req.Header.Set("User-Agent", browserUserAgent)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Referer", url2) // important
 
-	res, err = c.client.Do(req)
+	res, err = c.ssoClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -87,6 +120,9 @@ func (c *Client) getTicket(username, password string) (string, error) {
 	if ticket == "" {
 		if msg := core.Between(string(body), `class="error">`, `<`); msg != "" {
 			return "", errors.New("garmin: " + msg)
+		}
+		if core.Between(string(body), `"status-code":"`, `"`) == "429" {
+			return "", errors.New("garmin: rate limited (429), retry later")
 		}
 		return "", errors.New("garmin: can't find ticket")
 	}
